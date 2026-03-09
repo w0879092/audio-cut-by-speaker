@@ -56,3 +56,9 @@ print(' - Soundfile (张量桥接)  : 🟢 已成功导入')
 print('\n' + '='*40 + '\n')
 "
 
+
+### 跑单个文件
+python rag_audio_slicer-ali.py "/mnt/z/sample.m4a"(文件路径)
+
+### 跑文件夹
+python batch_runner-ali.py /mnt/z/sample (文件夹路径)
