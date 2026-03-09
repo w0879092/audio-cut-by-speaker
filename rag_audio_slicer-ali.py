@@ -12,13 +12,105 @@ import time
 import shutil
 import re  # 🌟 新增：用于解析 FFmpeg 静音探测日志
 from tqdm import tqdm
-from pyannote.audio import Pipeline, Model
-from pyannote.audio.core.inference import Inference
+from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.utils.hook import ProgressHook
 from scipy.spatial.distance import cosine
+# 新增的依赖导入（请添加到代码顶部）
+import tempfile
+import soundfile as sf
 
 # ================= 🌟 核心保命符 =================
-torch.backends.cudnn.enabled = False 
+# 在 WSL2 + AMD ROCm 环境下，必须设为 False 以防 MIOpen 内存死锁
+torch.backends.cudnn.enabled = False
+
+# ================= 新增：阿里 CAM++ 桥接与滑动清洗函数 =================
+
+def extract_campplus_embedding(crop_tensor, sample_rate, sv_pipeline):
+    """
+    底层桥接函数：将 PyTorch 音频张量转换为 ModelScope 支持的文件格式，并提取高维特征
+    """
+    wav_np = crop_tensor.squeeze().cpu().numpy()
+    
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+        tmp_path = tmp.name
+    sf.write(tmp_path, wav_np, sample_rate)
+    
+    try:
+        # 核心修复：添加 output_emb=True 参数，指示模型仅提取声纹特征
+        result = sv_pipeline([tmp_path], output_emb=True)
+        
+        # 兼容外层列表嵌套
+        if isinstance(result, list):
+            result = result[0]
+            
+        # 提取高维声纹特征向量并自适应不同版本的键名
+        if 'embs' in result:
+            emb_data = result['embs']
+            if isinstance(emb_data, list):
+                emb_data = emb_data[0]
+            embedding = np.array(emb_data).flatten().tolist()
+        elif 'spk_embedding' in result:
+            embedding = np.array(result['spk_embedding']).flatten().tolist()
+        elif 'embeddings' in result:
+            embedding = np.array(result['embeddings']).flatten().tolist()
+        else:
+            raise ValueError(f"未能找到特征字段，模型返回的数据为: {result}")
+            
+    finally:
+        os.remove(tmp_path)
+        
+    return embedding
+
+def extract_robust_fingerprint_campplus(waveform, sample_rate, sv_pipeline):
+    """
+    多尺度滑动窗口特征清洗器
+    """
+    WINDOW_SIZE = 1.5
+    STEP_SIZE = 0.5
+    KEEP_RATIO = 0.8
+    
+    duration = waveform.shape[1] / sample_rate
+    
+    # 极短音频保护：如果不足 1.5 秒，直接全局提取一次
+    if duration < WINDOW_SIZE:
+        return extract_campplus_embedding(waveform, sample_rate, sv_pipeline)
+        
+    vectors = []
+    start_time = 0.0
+    
+    # 密集滑动采样
+    while start_time + WINDOW_SIZE <= duration:
+        end_time = start_time + WINDOW_SIZE
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+        
+        crop = waveform[:, start_sample:end_sample]
+        vec = extract_campplus_embedding(crop, sample_rate, sv_pipeline)
+        vectors.append(vec)
+        
+        start_time += STEP_SIZE
+        
+    vectors_np = np.array(vectors)
+    if len(vectors_np) == 0:
+        return extract_campplus_embedding(waveform, sample_rate, sv_pipeline)
+        
+    # 计算高维几何中心
+    center_vector = np.mean(vectors_np, axis=0)
+    
+    # 计算所有向量到中心点的偏差（余弦距离）
+    distances = [cosine(v, center_vector) for v in vectors_np]
+    
+    # 排序并无情抛弃最远（畸变严重）的 20% 数据点
+    keep_count = max(1, int(len(vectors_np) * KEEP_RATIO))
+    sorted_indices = np.argsort(distances)
+    kept_indices = sorted_indices[:keep_count]
+    
+    kept_vectors = vectors_np[kept_indices]
+    
+    # 将幸存的高质量向量进行终极数学融合
+    final_vector = np.mean(kept_vectors, axis=0)
+    
+    return final_vector.tolist()
 
 # ================= 1. 命令行交互设计 =================
 parser = argparse.ArgumentParser(description="🤖 祷告塔 AI 智能分布式声纹切割引擎")
@@ -51,7 +143,7 @@ LEARNING_THRESHOLD = 0.90     # 自进化学习线 (防过度重复死记硬背)
 MAX_VECTORS_PER_PERSON = 15   # 每人最多保留10个高清变异音色
 MAX_ENROLL_PAUSE = 2          # 允许缝合的最大停顿时间
 SILENCE_DB_THRESHOLD = -45.0  # 🌟 新增：物理静音闸门，拦截幽灵说话人
-MIN_DIALOGUE_DURATION = 10.0  # 🌟 新增：物理输出最低底线，拦截孤岛碎片
+MIN_DIALOGUE_DURATION = 12.0  # 🌟 新增：物理输出最低底线，拦截孤岛碎片
 SPLIT_THRESHOLD = 4 * 3600    # 🌟 新增：超长音频切分阈值 (4小时)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -282,11 +374,18 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
     annotation = diarization_result.speaker_diarization if hasattr(diarization_result, "speaker_diarization") else diarization_result
 
     # ================= 8. 提取指纹与声纹比对 (步骤 2/4) =================
-    print(f"\n🧬 [步骤 2/4] 正在提取指纹 (CPU 极致稳健模式) {chunk_label}...")
+    print(f"\n🧬 [步骤 2/4] 正在提取指纹 (CAM++ 极致稳健模式) {chunk_label}...")
     t_load_emb = time.time()
     
-    embedding_model = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", token=HF_TOKEN).to("cpu")
-    inference = Inference(embedding_model, window="whole") 
+    from modelscope.pipelines import pipeline as ms_pipeline
+    from modelscope.utils.constant import Tasks
+    
+    # 加载阿里 3D-Speaker ERes2NetV2 终极版中文母语模型
+    camplus_pipeline = ms_pipeline(
+        task=Tasks.speaker_verification, 
+        model='iic/speech_eres2netv2_sv_zh-cn_16k-common', # 🌟 已修改为 V2 终极版
+        device='cuda' 
+    )
     
     time_records[f'4. 声纹模型加载 {chunk_label}'] = time.time() - t_load_emb
 
@@ -338,7 +437,7 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
         pure_fragments = [f for f in pure_fragments if f[1] - f[0] >= 1.0]
         
         if not pure_fragments:
-            speaker_mapping[spk] = spk 
+            speaker_mapping[spk] = "IGNORE_OVERLAP" 
             tqdm.write(f"  🔇 忽略 {spk}: 剔除重叠污染后无纯净片段，不予识别。")
             continue
 
@@ -372,6 +471,10 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
                     if acc_duration >= 60.0:
                         break
                 crop = torch.cat(crops, dim=1)
+            else:
+                speaker_mapping[spk] = "IGNORE_SHORT" 
+                tqdm.write(f"  🔇 忽略 {spk}: 最长连续发言仅 {max_duration:.1f}s，不予识别。")
+                continue
 
         rms = torch.sqrt(torch.mean(crop ** 2))
         dbfs = 20 * torch.log10(rms + 1e-9).item()
@@ -382,11 +485,13 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
             continue
         
         if max_duration < MIN_QUERY_DURATION:
-            speaker_mapping[spk] = spk 
+            speaker_mapping[spk] = "IGNORE_SHORT"
             tqdm.write(f"  🔇 忽略 {spk}: 最长连续发言仅 {max_duration:.1f}s，不予识别。")
             continue
             
-        vector = inference({"waveform": crop, "sample_rate": sample_rate}).tolist()
+        # ---------- 核心替换点：应用多尺度滑动窗口提取特征 ----------
+        vector = extract_robust_fingerprint_campplus(crop, sample_rate, camplus_pipeline)
+        
         matched_name, sim = identify_speaker(vector, speaker_db)
         
         if matched_name:
@@ -397,6 +502,7 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
                 if sim < LEARNING_THRESHOLD and len(speaker_db[matched_name]["vectors"]) < MAX_VECTORS_PER_PERSON:
                     speaker_db[matched_name]["vectors"].append(vector)
                     tqdm.write(f"  🧠 AI已安全吸收【{matched_name}】的全新音色特征。")
+                    # 🌟 修复：恢复保存黄金片段
                     golden_segments_to_cut.append({"speaker": matched_name, "segments": golden_segments, "is_concatenated": is_concatenated})
         else:
             if max_duration >= MIN_ENROLL_DURATION:
@@ -404,15 +510,18 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
                 tqdm.write(f"  🆕 建档 {spk} -> 录入主脑数据库【{new_id}】 (采样时长: {max_duration:.1f}s)")
                 speaker_db[new_id] = {"vectors": [vector]}
                 speaker_mapping[spk] = new_id
+                # 🌟 修复：恢复保存黄金片段
                 golden_segments_to_cut.append({"speaker": new_id, "segments": golden_segments, "is_concatenated": is_concatenated})
             else:
-                speaker_mapping[spk] = spk
+                speaker_mapping[spk] = "IGNORE_UNIDENTIFIED"
                 tqdm.write(f"  ⚠️ 拒收 {spk}: 发现新声音，但最长发言仅 {max_duration:.1f}s，未达建档线。")
 
     save_json_db(speaker_db, LOCAL_DB_PATH)
     
     # 🌟 物理清场机制：提前释放，杜绝 fork 死锁
-    del embedding_model, inference, waveform, wav_np
+    del waveform, wav_np
+    if 'camplus_pipeline' in locals():
+        del camplus_pipeline
     gc.collect()
     torch.cuda.empty_cache()
     time_records[f'5. 指纹提取与自进化 {chunk_label}'] = time.time() - t2
@@ -470,7 +579,7 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
     for t in raw_turns:
         t["speaker"] = speaker_mapping.get(t["speaker"], t["speaker"])
         
-    valid_turns = [t for t in raw_turns if t["speaker"] != "GHOST_SILENCE"]
+    valid_turns = [t for t in raw_turns if t["speaker"] != "GHOST_SILENCE" and not str(t["speaker"]).startswith("IGNORE_")]
     valid_turns.sort(key=lambda x: x["start"])
     
     # 🌟 调用模块二：执行动态静音管理与极短插话吸收
@@ -532,6 +641,53 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
     if current_block:
         blocks.append(current_block)
 
+    # ================= 🌟 第3.5阶段：孤岛与短对话智能扩展合并机制 =================
+    def get_block_dur(b):
+        return b[-1]['end'] - b[0]['start']
+        
+    def is_multi_dialogue(b):
+        if len(b) <= 1: return False
+        tot = sum(t['end'] - t['start'] for t in b)
+        if tot == 0: return False
+        spk_durs = {}
+        for t in b:
+            spk_durs[t['speaker']] = spk_durs.get(t['speaker'], 0.0) + (t['end'] - t['start'])
+        max_r = max(spk_durs.values()) / tot
+        return max_r <= 0.80
+
+    # 循环扫描，直到没有任何片段需要合并为止
+    while True:
+        has_merged = False
+        final_blocks = []
+        for block in blocks:
+            if not final_blocks:
+                final_blocks.append(block)
+                continue
+            
+            prev_block = final_blocks[-1]
+            prev_dur = get_block_dur(prev_block)
+            curr_dur = get_block_dur(block)
+            
+            # 判定 1：绝对物理底线 (< 12秒)
+            prev_is_island = prev_dur < MIN_DIALOGUE_DURATION
+            curr_is_island = curr_dur < MIN_DIALOGUE_DURATION
+            
+            # 判定 2：多人对话合并门槛 (< 3倍底线，即36秒)
+            prev_is_short_multi = is_multi_dialogue(prev_block) and prev_dur < (MIN_DIALOGUE_DURATION * 3.0)
+            curr_is_short_multi = is_multi_dialogue(block) and curr_dur < (MIN_DIALOGUE_DURATION * 3.0)
+            
+            # 如果当前块或前一块触发了吞灭条件，立即将它们无缝缝合
+            if prev_is_island or curr_is_island or prev_is_short_multi or curr_is_short_multi:
+                final_blocks[-1].extend(block)
+                has_merged = True
+            else:
+                final_blocks.append(block)
+                
+        blocks = final_blocks
+        # 如果整次遍历都没有发生任何合并，说明全都达标了，跳出循环
+        if not has_merged:
+            break
+
     # ================= 🌟 第四阶段：最终产出标注逻辑 =================
     output_segments = []
     for block in blocks:
@@ -573,6 +729,7 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
     print(f"\n✂️ [步骤 4/4] 正在本地进行极速无损切割，共 {len(output_segments)} 段 {chunk_label}...")
     t4 = time.time()
     
+    # 🌟 修复后的提取黄金声纹逻辑
     for seg_info in tqdm(golden_segments_to_cut, desc=f"提取黄金声纹片段 {chunk_label}", unit="段"):
         feature_filename = f"{seg_info['speaker']}说话人特征{file_ext}"
         feature_filepath = os.path.join(local_temp_output, feature_filename)
@@ -599,8 +756,8 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
             subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     for i, seg in enumerate(tqdm(output_segments, desc=f"物理切割音频 {chunk_label}", unit="段")):
-        # 🌟 严格落实极简命名逻辑，剔除时长，统一标签前置，结合四阶段画像动态命名
-        filename = f"{seg['speaker']}_{seg['mode']}_{global_index_start + i + 1:03d}{file_ext}"
+        # 🌟 严格落实极简命名逻辑：将序号置于最前，保障系统级按时间轴排序
+        filename = f"{global_index_start + i + 1:03d}_{seg['speaker']}_{seg['mode']}{file_ext}"
         local_filepath = os.path.join(local_temp_output, filename)
 
         cmd = ["ffmpeg", "-y", "-ss", str(seg['start']), "-t", str(seg['end'] - seg['start']),
