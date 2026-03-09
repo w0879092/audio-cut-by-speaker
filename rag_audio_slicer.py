@@ -50,7 +50,7 @@ SIMILARITY_THRESHOLD = 0.82   # 严苛的认人及格线 (防误判)
 LEARNING_THRESHOLD = 0.90     # 自进化学习线 (防过度重复死记硬背)
 MAX_VECTORS_PER_PERSON = 15   # 每人最多保留10个高清变异音色
 MAX_ENROLL_PAUSE = 2          # 允许缝合的最大停顿时间
-SILENCE_DB_THRESHOLD = -35.0  # 🌟 新增：物理静音闸门，拦截幽灵说话人
+SILENCE_DB_THRESHOLD = -45.0  # 🌟 新增：物理静音闸门，拦截幽灵说话人
 MIN_DIALOGUE_DURATION = 10.0  # 🌟 新增：物理输出最低底线，拦截孤岛碎片
 SPLIT_THRESHOLD = 4 * 3600    # 🌟 新增：超长音频切分阈值 (4小时)
 
