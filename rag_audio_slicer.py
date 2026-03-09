@@ -37,7 +37,7 @@ local_temp_workspace = "./Local_AI_Workspace"
 local_temp_input = os.path.join(local_temp_workspace, "temp_input")
 local_temp_output = os.path.join(local_temp_workspace, "temp_output")
 
-HF_TOKEN = ""
+HF_TOKEN = " "
 
 MONOLOGUE_THRESHOLD = 180.0
 MAX_PAUSE_MERGE = 5.0
