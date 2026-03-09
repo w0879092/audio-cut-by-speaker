@@ -6,7 +6,7 @@ import argparse
 
 # ================= 1. 核心路径与扫描配置 =================
 # 调用的子船脚本路径
-SLICER_SCRIPT = "rag_audio_slicer.py"
+SLICER_SCRIPT = "rag_audio_slicer-ali.py"
 # 断点续传账本路径 (记录已处理的文件指纹)
 PROGRESS_LOG = "processed_files.json"
 
