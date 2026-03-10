@@ -1,7 +1,12 @@
 import argparse
 import os
+
+# ================= 🌟 原生 Ubuntu 性能解放：环境预检与隔离 =================
 # 必须放在 import torch 之前
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# 🌟 强制锁定第一张独立显卡 (RX 7900 XT)，彻底屏蔽 Ryzen 核显干扰
+os.environ["HIP_VISIBLE_DEVICES"] = "0"
+
 import json
 import gc
 import subprocess
@@ -19,9 +24,12 @@ from scipy.spatial.distance import cosine
 import tempfile
 import soundfile as sf
 
-# ================= 🌟 核心保命符 =================
-# 在 WSL2 + AMD ROCm 环境下，必须设为 False 以防 MIOpen 内存死锁
-torch.backends.cudnn.enabled = False
+# ================= 🌟 核心算力解放符 =================
+# 在纯血 Ubuntu + ROCm 6.3 环境下，MIOpen 引擎已完美支持
+# 彻底解除 WSL 时代的封印，开启硬件级卷积加速！
+torch.backends.cudnn.enabled = True
+# 🌟 开启自动内核寻优：让框架自动为 RX 7900 XT 匹配最快的矩阵计算法则
+torch.backends.cudnn.benchmark = True
 
 # ================= 新增：阿里 CAM++ 桥接与滑动清洗函数 =================
 
@@ -641,10 +649,17 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
     if current_block:
         blocks.append(current_block)
 
-    # ================= 🌟 第3.5阶段：孤岛与短对话智能扩展合并机制 =================
+    # ================= 🌟 第3.5阶段：孤岛、短对话与同源主讲人智能扩展合并机制 =================
     def get_block_dur(b):
         return b[-1]['end'] - b[0]['start']
         
+    def get_main_speaker(b):
+        # 提取当前音频块中发言时间最长的绝对主讲人
+        spk_durs = {}
+        for t in b:
+            spk_durs[t['speaker']] = spk_durs.get(t['speaker'], 0.0) + (t['end'] - t['start'])
+        return max(spk_durs, key=spk_durs.get)
+
     def is_multi_dialogue(b):
         if len(b) <= 1: return False
         tot = sum(t['end'] - t['start'] for t in b)
@@ -676,15 +691,17 @@ def process_audio_chunk(chunk_path, time_offset=0.0, global_index_start=0, chunk
             prev_is_short_multi = is_multi_dialogue(prev_block) and prev_dur < (MIN_DIALOGUE_DURATION * 3.0)
             curr_is_short_multi = is_multi_dialogue(block) and curr_dur < (MIN_DIALOGUE_DURATION * 3.0)
             
-            # 如果当前块或前一块触发了吞灭条件，立即将它们无缝缝合
-            if prev_is_island or curr_is_island or prev_is_short_multi or curr_is_short_multi:
+            # 判定 3：同主讲人无界缝合 (破解长停顿导致的连续碎块)
+            is_same_main = (get_main_speaker(prev_block) == get_main_speaker(block))
+            
+            # 只要触发任何一个吸收条件，立即进行物理合并
+            if prev_is_island or curr_is_island or prev_is_short_multi or curr_is_short_multi or is_same_main:
                 final_blocks[-1].extend(block)
                 has_merged = True
             else:
                 final_blocks.append(block)
                 
         blocks = final_blocks
-        # 如果整次遍历都没有发生任何合并，说明全都达标了，跳出循环
         if not has_merged:
             break
 
